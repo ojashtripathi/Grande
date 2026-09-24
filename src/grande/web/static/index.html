@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en" data-theme="">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Grande</title>
+<link rel="stylesheet" href="/static/css/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='4' fill='%232b5170'/><text x='16' y='23' font-family='sans-serif' font-size='19' font-weight='bold' fill='%23f5f2ea' text-anchor='middle'>G</text></svg>">
+</head>
+<body>
+
+<!-- Icon sprite. Vendored so the app never reaches the network. -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <g id="i-table" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M3 15h18M9 3v18"/></g>
+    <g id="i-pivot" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/><path d="M13 13h4M13 17h4"/></g>
+    <g id="i-clean" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M9 4V2M15 20v2M4.9 6.9 3.5 5.5M19.1 17.1l1.4 1.4M4 12H2M22 12h-2"/>
+      <path d="m14.5 3.5 6 6L9 21H3v-6z"/></g>
+    <g id="i-export" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></g>
+    <g id="i-sql" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="3" y="3" width="18" height="18" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/></g>
+    <g id="i-folder" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2z"/></g>
+    <g id="i-file" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></g>
+    <g id="i-filter" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M3 4h18l-7 8v6l-4 2v-8z"/></g>
+    <g id="i-x" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></g>
+    <g id="i-search" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round">
+      <circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></g>
+    <g id="i-more" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+      <circle cx="12" cy="5" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/></g>
+    <g id="i-up" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 15 7-7 7 7"/></g>
+    <g id="i-down" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 9 7 7 7-7"/></g>
+    <g id="i-right" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 5 7 7-7 7"/></g>
+    <g id="i-sun" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round">
+      <circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></g>
+    <g id="i-moon" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8"/></g>
+    <g id="i-check" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m20 6-11 11-5-5"/></g>
+    <g id="i-alert" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></g>
+    <g id="i-info" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></g>
+    <g id="i-loader" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+      <path d="M12 3v3M12 18v3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M3 12h3M18 12h3M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1"/></g>
+    <g id="i-undo" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M3 7v6h6"/><path d="M3.5 13a9 9 0 1 0 2.1-9.4L3 7"/></g>
+    <g id="i-open" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></g>
+    <g id="i-plus" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></g>
+    <g id="i-sum" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M18 5H6l6 7-6 7h12"/></g>
+    <g id="i-columns" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M12 3v18"/></g>
+  </defs>
+</svg>
+
+<div id="app">
+  <div class="brand"><span class="brand-mark">G</span><span>Grande</span></div>
+
+  <header class="topbar">
+    <button class="btn" id="btn-open"><svg class="icon"><use href="#i-folder"/></svg>Open file</button>
+    <div class="file-chip" id="file-chip" hidden>
+      <svg class="icon" style="color:var(--text-subtle)"><use href="#i-file"/></svg>
+      <span class="name" id="file-name"></span>
+      <span class="meta" id="file-meta"></span>
+      <button class="chip-x btn-ghost btn-icon btn-sm" id="btn-close-file" title="Close this file" aria-label="Close file">
+        <svg class="icon" style="width:13px;height:13px"><use href="#i-x"/></svg>
+      </button>
+    </div>
+    <div id="job-slot"></div>
+    <span class="spacer"></span>
+    <button class="btn btn-ghost btn-sm" id="btn-palette" title="Command palette">
+      <svg class="icon" style="width:14px;height:14px"><use href="#i-search"/></svg>
+      <kbd>Ctrl K</kbd>
+    </button>
+    <button class="btn btn-ghost btn-icon" id="btn-theme" title="Switch theme" aria-label="Switch theme">
+      <svg class="icon" id="theme-icon"><use href="#i-moon"/></svg>
+    </button>
+  </header>
+
+  <nav class="rail" aria-label="Sections">
+    <button class="rail-btn" data-view="data" aria-current="true">
+      <svg class="icon"><use href="#i-table"/></svg>Data</button>
+    <button class="rail-btn" data-view="pivot" disabled>
+      <svg class="icon"><use href="#i-pivot"/></svg>Pivot</button>
+    <button class="rail-btn" data-view="clean" disabled>
+      <svg class="icon"><use href="#i-clean"/></svg>Clean</button>
+    <button class="rail-btn" data-view="export" disabled>
+      <svg class="icon"><use href="#i-export"/></svg>Export</button>
+    <span class="rail-spacer"></span>
+    <button class="rail-btn" data-view="sql" disabled>
+      <svg class="icon"><use href="#i-sql"/></svg>SQL</button>
+  </nav>
+
+  <main class="main">
+
+    <!-- DATA ------------------------------------------------------------- -->
+    <section class="view" id="view-data">
+      <div class="empty-state" id="data-empty">
+        <div class="empty-inner">
+          <div class="empty-mark"><svg class="icon"><use href="#i-table"/></svg></div>
+          <h2>Open a file to begin</h2>
+          <p>CSV, TSV, Excel, Parquet or JSON — including files far beyond Excel's
+             1,048,576-row limit. Nothing leaves this computer.</p>
+          <button class="btn btn-primary" id="btn-open-2">
+            <svg class="icon"><use href="#i-folder"/></svg>Choose a file</button>
+        </div>
+      </div>
+
+      <div class="toolbar" id="data-toolbar" hidden>
+        <div style="position:relative;display:flex;align-items:center">
+          <svg class="icon" style="position:absolute;left:7px;width:14px;height:14px;color:var(--text-subtle);pointer-events:none"><use href="#i-search"/></svg>
+          <input class="field" id="search" placeholder="Search all rows…" style="padding-left:26px;width:230px">
+        </div>
+        <div id="filter-chips" style="display:flex;gap:5px;flex-wrap:wrap"></div>
+        <button class="btn btn-ghost btn-sm" id="btn-clear-filters" hidden>Clear all</button>
+        <span class="spacer"></span>
+        <button class="btn btn-sm" id="btn-columns"><svg class="icon" style="width:14px;height:14px"><use href="#i-columns"/></svg>Columns</button>
+        <button class="btn btn-sm" id="btn-export-view"><svg class="icon" style="width:14px;height:14px"><use href="#i-export"/></svg>Export</button>
+      </div>
+
+      <div class="grid-wrap" id="grid-wrap" hidden tabindex="0">
+        <div class="grid-sizer" id="grid-sizer"><table class="grid" id="grid"></table></div>
+      </div>
+    </section>
+
+    <!-- PIVOT ------------------------------------------------------------ -->
+    <section class="view" id="view-pivot" hidden>
+      <div class="toolbar">
+        <label class="field-label" style="margin:0 4px 0 0">Layout</label>
+        <select class="field field-sm" id="pivot-layout">
+          <option value="compact">Compact form</option>
+          <option value="outline">Outline form</option>
+          <option value="tabular">Tabular form</option>
+        </select>
+        <button class="btn btn-sm" id="pivot-subtotals-btn">Subtotals</button>
+        <button class="btn btn-sm" id="pivot-totals-btn">Grand Totals</button>
+        <button class="btn btn-sm" id="pivot-expand">Expand All</button>
+        <button class="btn btn-sm" id="pivot-collapse">Collapse All</button>
+        <span id="pivot-note"></span>
+        <span class="spacer"></span>
+        <button class="btn btn-sm" id="pivot-sql">Show SQL</button>
+        <button class="btn btn-sm" id="pivot-export">
+          <svg class="icon" style="width:14px;height:14px"><use href="#i-export"/></svg>Export</button>
+        <button class="btn btn-sm btn-ghost btn-icon" id="pivot-fields-toggle"
+                title="Show or hide the field list" aria-label="Show or hide the field list">
+          <svg class="icon"><use href="#i-columns"/></svg></button>
+      </div>
+
+      <div class="split">
+        <div class="pivot-canvas" id="pivot-canvas">
+          <div id="pivot-filters" class="pivot-filters" hidden></div>
+          <div class="pivot-scroll" id="pivot-wrap">
+            <div class="empty-state" id="pivot-empty">
+              <div class="empty-inner">
+                <div class="empty-mark"><svg class="icon"><use href="#i-pivot"/></svg></div>
+                <h2>Build a PivotTable</h2>
+                <p>Tick a field on the right, or drag it into <b>Rows</b>, <b>Columns</b>
+                   or <b>Values</b> — the same way as in Excel. Totals are calculated
+                   from every row in the file, not from what is on screen.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Excel keeps the field list on the right; so do we. -->
+        <aside class="pivot-pane" id="pivot-pane">
+          <div class="pane-head">
+            <span>PivotTable Fields</span>
+            <button class="btn btn-ghost btn-icon btn-sm" id="pivot-pane-close"
+                    aria-label="Hide the field list"><svg class="icon" style="width:13px;height:13px"><use href="#i-x"/></svg></button>
+          </div>
+          <div class="pane-sub">Choose fields to add to report:</div>
+          <div class="pane-search">
+            <input class="field" id="pivot-search" placeholder="Search fields" spellcheck="false">
+          </div>
+          <div class="pane-fields" id="pivot-fieldlist"></div>
+          <div class="pane-sub pane-sub-areas">Drag fields between areas below:</div>
+          <div class="pane-areas">
+            <div class="area" data-zone="filters">
+              <div class="area-head"><svg class="icon" style="width:13px;height:13px"><use href="#i-filter"/></svg> Filters</div>
+              <div class="area-drop" id="zone-filters" data-zone="filters"></div>
+            </div>
+            <div class="area" data-zone="columns">
+              <div class="area-head"><svg class="icon" style="width:13px;height:13px"><use href="#i-columns"/></svg> Columns</div>
+              <div class="area-drop" id="zone-columns" data-zone="columns"></div>
+            </div>
+            <div class="area" data-zone="rows">
+              <div class="area-head"><svg class="icon" style="width:13px;height:13px"><use href="#i-table"/></svg> Rows</div>
+              <div class="area-drop" id="zone-rows" data-zone="rows"></div>
+            </div>
+            <div class="area" data-zone="values">
+              <div class="area-head"><svg class="icon" style="width:13px;height:13px"><use href="#i-sum"/></svg> Values</div>
+              <div class="area-drop" id="zone-values" data-zone="values"></div>
+            </div>
+          </div>
+          <div class="pane-foot">
+            <label class="check" style="padding-left:0">
+              <input type="checkbox" id="pivot-defer"> <span class="v">Defer Layout Update</span>
+            </label>
+            <button class="btn btn-sm" id="pivot-update" disabled>Update</button>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <!-- CLEAN ------------------------------------------------------------ -->
+    <section class="view" id="view-clean" hidden>
+      <div class="toolbar">
+        <span class="overline">Clean up</span>
+        <span class="spacer"></span>
+        <button class="btn btn-sm" id="btn-undo" disabled>
+          <svg class="icon" style="width:14px;height:14px"><use href="#i-undo"/></svg>Undo</button>
+      </div>
+      <div class="split" style="flex:1;min-height:0">
+        <div style="flex:1;overflow:auto;padding:var(--s-5)">
+          <div style="max-width:660px;display:grid;gap:var(--s-3)" id="clean-actions"></div>
+        </div>
+        <aside class="panel" style="border-right:none;border-left:1px solid var(--border-strong);width:300px">
+          <div class="panel-head">Steps applied</div>
+          <div class="panel-body" id="recipe-list"></div>
+        </aside>
+      </div>
+    </section>
+
+    <!-- EXPORT ----------------------------------------------------------- -->
+    <section class="view" id="view-export" hidden>
+      <div style="flex:1;overflow:auto;padding:var(--s-5)">
+        <div style="max-width:660px" id="export-form"></div>
+      </div>
+    </section>
+
+    <!-- SQL -------------------------------------------------------------- -->
+    <section class="view" id="view-sql" hidden>
+      <div style="padding:var(--s-3);border-bottom:1px solid var(--border);background:var(--surface)">
+        <textarea class="field" id="sql-text" rows="4" spellcheck="false"
+          placeholder="SELECT * FROM data LIMIT 100">SELECT * FROM data LIMIT 100</textarea>
+        <div style="display:flex;align-items:center;gap:var(--s-2);margin-top:var(--s-2)">
+          <button class="btn btn-primary btn-sm" id="sql-run">Run <kbd>Ctrl ⏎</kbd></button>
+          <span class="tag">Your data is the table <b style="margin-left:3px">data</b></span>
+          <span class="spacer"></span>
+          <span class="hint" id="sql-status" style="margin:0"></span>
+        </div>
+      </div>
+      <div class="grid-wrap" id="sql-wrap"></div>
+    </section>
+
+  </main>
+
+  <footer class="statusbar" id="statusbar"></footer>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<div id="layers"></div>
+
+<script type="module" src="/static/js/main.js"></script>
+</body>
+</html>
