@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "grande"
-version = "2.0.0"
+version = "2.0.2"
 description = "Work with spreadsheets too big for Excel — browse, filter, pivot and export tens of millions of rows, entirely on your own machine."
 readme = "README.md"
 requires-python = ">=3.10"

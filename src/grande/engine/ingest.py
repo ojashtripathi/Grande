@@ -17,8 +17,11 @@ from __future__ import annotations
 
 import csv
 import io
+import math
 import os
+import shutil
 import time
+import uuid
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,7 +30,7 @@ from typing import Any
 import duckdb
 
 from .session import Column, Dataset, Workspace, classify
-from .sql import ident
+from .sql import glob_escape, ident
 
 CSV_SUFFIXES = {".csv", ".tsv", ".txt", ".tab", ".psv", ".dat"}
 PARQUET_SUFFIXES = {".parquet", ".pq"}
@@ -45,6 +48,14 @@ DELIMITER_NAMES = {",": "comma", "\t": "tab", ";": "semicolon", "|": "pipe", " "
 
 class IngestError(RuntimeError):
     """A file could not be read, with a message written for a human."""
+
+
+class IngestCancelled(Exception):
+    """The person cancelled a load. Nothing was kept."""
+
+
+#: How often, at most, a streaming Excel load reports progress.
+EXCEL_PROGRESS_SECONDS = 0.25
 
 
 @dataclass
@@ -110,6 +121,39 @@ def classify_path(path: Path) -> str:
     return "csv"
 
 
+#: Encoding names DuckDB's CSV reader accepts. It rejects the usual aliases —
+#: "windows-1252" and "iso-8859-1" both fail — so the name has to be one of
+#: these exactly, or no non-UTF-8 file opens at all.
+DUCKDB_ENCODINGS = {"utf-8", "utf-16", "latin-1", "cp1252"}
+
+
+def _raw_head(path: Path, probe: int) -> bytes:
+    """The first bytes of a file's *content*, seeing through compression.
+
+    Sniffing the container instead of the content is why .gz and .zip files
+    were detected as cp1252 and then refused: compressed bytes are not valid
+    UTF-8, so every compressed file looked like a legacy encoding.
+    """
+    suffixes = [s.lower() for s in path.suffixes]
+    try:
+        if suffixes and suffixes[-1] == ".zip":
+            with zipfile.ZipFile(path) as archive:
+                names = [n for n in archive.namelist() if not n.endswith("/")]
+                if not names:
+                    return b""
+                with archive.open(names[0]) as member:
+                    return member.read(probe)
+        if suffixes and suffixes[-1] == ".gz":
+            import gzip
+
+            with gzip.open(path, "rb") as handle:
+                return handle.read(probe)
+    except (OSError, zipfile.BadZipFile, EOFError):
+        return b""
+    with open(path, "rb") as handle:
+        return handle.read(probe)
+
+
 def detect_encoding(path: Path, probe: int = 262_144) -> str:
     """Pick an encoding that will not throw. Deliberately conservative.
 
@@ -117,8 +161,9 @@ def detect_encoding(path: Path, probe: int = 262_144) -> str:
     UTF-8 BOM, valid UTF-8, a UTF-16 BOM, and "something else" (treated as
     cp1252, which is the usual source of stray £ and é in Windows CSVs).
     """
-    with open(path, "rb") as handle:
-        head = handle.read(probe)
+    head = _raw_head(path, probe)
+    if not head:
+        return "utf-8"
     if head.startswith(b"\xef\xbb\xbf"):
         return "utf-8"  # DuckDB strips the BOM itself when encoding is utf-8
     if head.startswith((b"\xff\xfe", b"\xfe\xff")):
@@ -132,7 +177,9 @@ def detect_encoding(path: Path, probe: int = 262_144) -> str:
             head[:-4].decode("utf-8")
             return "utf-8"
         except UnicodeDecodeError:
-            return "windows-1252"
+            # "cp1252", not "windows-1252": DuckDB rejects the latter outright,
+            # so returning it meant no non-UTF-8 file could be opened at all.
+            return "cp1252"
 
 
 def sniff_delimiter(sample: str) -> str:
@@ -239,7 +286,7 @@ def detect_date_format(path: Path, delimiter: str | None = None) -> str | None:
     """
     con = duckdb.connect()
     try:
-        cur = con.execute("SELECT * FROM sniff_csv(?)", [str(path)])
+        cur = con.execute("SELECT * FROM sniff_csv(?)", [glob_escape(path)])
         names = [d[0] for d in (cur.description or [])]
         row = cur.fetchone()
         if not row:
@@ -313,9 +360,13 @@ def _sniff_excel(path: Path, result: SniffResult) -> None:
         raise IngestError("That workbook has no sheets.")
     result.sheet = result.sheets[0]
 
-    sheet = workbook.get_sheet_by_name(result.sheet)
-    rows = sheet.to_python(skip_empty_area=True)
-    rows = [r for r in rows if any(str(c).strip() for c in r)]
+    # Only the header and twenty rows are shown, so read only those. Reading the
+    # whole sheet into Python first cost seconds and gigabytes on a big sheet
+    # before the dialog could appear.
+    rows = _calamine(
+        lambda: _first_rows(workbook.get_sheet_by_name(result.sheet), 21),
+        "That workbook could not be read",
+    )
     if not rows:
         result.notes.append("That sheet is empty.")
         return
@@ -328,14 +379,51 @@ def _sniff_excel(path: Path, result: SniffResult) -> None:
         result.notes.append(f"{len(result.sheets)} sheets in this workbook — pick one to open.")
 
 
+def _calamine(action: Any, failure: str) -> Any:
+    """Run a python-calamine call, turning every failure into an IngestError.
+
+    Some broken or unusual files make python-calamine panic, which reaches
+    Python as pyo3's PanicException: a BaseException, not an Exception, so it
+    slipped past every handler — and in a background load it ended the worker
+    silently, leaving the progress bar waiting for ever.
+    """
+    try:
+        return action()
+    except (KeyboardInterrupt, SystemExit, IngestError, IngestCancelled):
+        raise
+    except BaseException as exc:
+        raise IngestError(f"{failure}: {exc}") from exc
+
+
+def _is_blank(row: list[Any]) -> bool:
+    return not any(str(c).strip() for c in row)
+
+
+def _first_rows(sheet: Any, count: int) -> list[list[Any]]:
+    """The first ``count`` non-blank rows of a sheet, reading no further."""
+    # iter_rows panics on a sheet with no cells at all (height 0), and it also
+    # yields the empty rows above where the data starts; blank rows are skipped
+    # either way, which leaves exactly the rows to_python(skip_empty_area=True) had.
+    if not sheet.height:
+        return []
+    rows: list[list[Any]] = []
+    for row in sheet.iter_rows():
+        if _is_blank(row):
+            continue
+        rows.append(row)
+        if len(rows) == count:
+            break
+    return rows
+
+
 def _sniff_via_duckdb(path: Path, result: SniffResult) -> None:
     """Let DuckDB describe Parquet and JSON; it already knows their schemas."""
     con = duckdb.connect()
     try:
         reader = "read_parquet(?)" if result.kind == "parquet" else "read_json_auto(?)"
-        described = con.execute(f"DESCRIBE SELECT * FROM {reader}", [str(path)]).fetchall()
+        described = con.execute(f"DESCRIBE SELECT * FROM {reader}", [glob_escape(path)]).fetchall()
         result.columns = [{"name": r[0], "type": r[1], "kind": classify(r[1])} for r in described]
-        sample = con.execute(f"SELECT * FROM {reader} LIMIT 20", [str(path)]).fetchall()
+        sample = con.execute(f"SELECT * FROM {reader} LIMIT 20", [glob_escape(path)]).fetchall()
         result.sample_rows = [[_jsonable(c) for c in row] for row in sample]
     except duckdb.Error as exc:
         raise IngestError(f"That file could not be read: {exc}") from exc
@@ -344,7 +432,11 @@ def _sniff_via_duckdb(path: Path, result: SniffResult) -> None:
 
 
 def _jsonable(value: Any) -> Any:
-    if value is None or isinstance(value, (str, int, float, bool)):
+    # NaN and infinity have no JSON form: a preview row holding one made the
+    # whole reply unreadable to the browser, so the file seemed not to open.
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if value is None or isinstance(value, (str, int, bool)):
         return value
     return str(value)
 
@@ -364,11 +456,15 @@ def ingest(
     all_varchar: bool = False,
     date_format: str | None = None,
     progress: Any = None,
+    cancel: Any = None,
 ) -> Dataset:
     """Read ``path`` into a new table and register it on the workspace.
 
     ``progress`` is an optional callable taking ``(phase, detail)`` so long loads
-    can narrate themselves honestly rather than animating a fake percentage.
+    can narrate themselves honestly rather than animating a fake percentage; a
+    load that can measure itself (an Excel sheet) also passes a third argument,
+    the percent done. ``cancel`` is an optional event: once it is set, an Excel
+    load stops at its next check and raises :class:`IngestCancelled`.
     """
     file_path = Path(path).expanduser()
     if not file_path.exists():
@@ -378,15 +474,24 @@ def ingest(
     table = workspace.new_table_name()
     started = time.time()
     notes: list[str] = []
+    warnings: list[str] = []
 
-    def say(phase: str, detail: str = "") -> None:
-        if progress:
+    def say(phase: str, detail: str = "", percent: float | None = None) -> None:
+        if not progress:
+            return
+        if percent is None:
             progress(phase, detail)
+        else:
+            progress(phase, detail, percent)
 
     say("reading", f"Reading {file_path.name}")
 
     if kind == "excel":
-        _ingest_excel(workspace, file_path, table, sheet=sheet, has_header=has_header, notes=notes)
+        _ingest_excel(
+            workspace, file_path, table,
+            sheet=sheet, has_header=has_header, all_varchar=all_varchar,
+            notes=notes, say=say, cancel=cancel,
+        )
     else:
         _ingest_via_duckdb(
             workspace,
@@ -399,13 +504,13 @@ def ingest(
             all_varchar=all_varchar,
             date_format=date_format,
             notes=notes,
+            warnings=warnings,
         )
 
     say("indexing", "Working out column types")
     columns = workspace.describe_table(table)
     row_count = workspace.count_rows(table)
 
-    warnings: list[str] = []
     if kind == "csv" and any(c.kind == "date" for c in columns):
         used = date_format or detect_date_format(file_path, delimiter)
         if used in AMBIGUOUS_DATE_FORMATS:
@@ -456,21 +561,22 @@ def _ingest_via_duckdb(
     has_header: bool,
     all_varchar: bool,
     notes: list[str],
+    warnings: list[str],
     date_format: str | None = None,
 ) -> None:
     quoted = ident(table)
     if kind == "parquet":
         sql = f"CREATE OR REPLACE TABLE {quoted} AS SELECT * FROM read_parquet(?)"
-        params: list[Any] = [str(path)]
+        params: list[Any] = [glob_escape(path)]
     elif kind == "json":
         sql = f"CREATE OR REPLACE TABLE {quoted} AS SELECT * FROM read_json_auto(?)"
-        params = [str(path)]
+        params = [glob_escape(path)]
     else:
         _ingest_csv(
             workspace, path, table,
             delimiter=delimiter, encoding=encoding,
             has_header=has_header, all_varchar=all_varchar, notes=notes,
-            date_format=date_format,
+            warnings=warnings, date_format=date_format,
         )
         return
 
@@ -496,42 +602,127 @@ def _ingest_csv(
     has_header: bool,
     all_varchar: bool,
     notes: list[str],
+    warnings: list[str],
     date_format: str | None = None,
 ) -> None:
-    """Load a delimited file, escalating through progressively safer readers.
+    """Settle the encoding and the container, then hand off to the reader."""
+    encoding = encoding or detect_encoding(path)
+    delimiter = delimiter or sniff_delimiter(_read_text_head(path, encoding, 131_072))
+
+    if encoding not in DUCKDB_ENCODINGS:
+        notes.append(f"“{encoding}” is not a supported encoding; reading as Latin-1.")
+        encoding = "latin-1"
+
+    # DuckDB reads .gz and .zst itself but not .zip, so a zip is unpacked to the
+    # workspace first. The extracted copy is removed once the table is built.
+    extracted: Path | None = None
+    if path.suffixes and path.suffixes[-1].lower() == ".zip":
+        extracted = _extract_zip(workspace, path, notes)
+        path = extracted
+
+    try:
+        _read_csv_with_escalation(
+            workspace, path, table,
+            delimiter=delimiter, encoding=encoding, has_header=has_header,
+            all_varchar=all_varchar, notes=notes, warnings=warnings,
+            date_format=date_format,
+        )
+    finally:
+        if extracted is not None:
+            try:
+                extracted.unlink()
+            except OSError:
+                pass
+
+
+def _extract_zip(workspace: Workspace, path: Path, notes: list[str]) -> Path:
+    """Unpack the first data file from a .zip into the workspace."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            members = [n for n in archive.namelist() if not n.endswith("/")]
+            if not members:
+                raise IngestError("That .zip archive is empty.")
+            readable = [n for n in members if classify_path(Path(n)) != "excel"] or members
+            chosen = readable[0]
+            if len(members) > 1:
+                notes.append(
+                    f"The archive holds {len(members)} files; opened “{chosen}”."
+                )
+            # Unique per extraction: two opens running at once may unpack
+            # members with the same name, and each deletes its copy when done.
+            target = workspace.spill_dir / (
+                f"unzipped-{os.getpid()}-{uuid.uuid4().hex[:8]}-{Path(chosen).name}"
+            )
+            with archive.open(chosen) as source, open(target, "wb") as sink:
+                shutil.copyfileobj(source, sink, length=1024 * 1024)
+            return target
+    except zipfile.BadZipFile as exc:
+        raise IngestError("That .zip archive could not be opened.") from exc
+
+
+def _read_csv_with_escalation(
+    workspace: Workspace,
+    path: Path,
+    table: str,
+    *,
+    delimiter: str,
+    encoding: str,
+    has_header: bool,
+    all_varchar: bool,
+    notes: list[str],
+    warnings: list[str],
+    date_format: str | None,
+) -> None:
+    """Read a delimited file, escalating through progressively safer readers.
 
     Real exports break in a few predictable ways and each remedy costs
     something, so each is applied only once it is needed:
 
-    1. The fast path — DuckDB's parallel scanner, inferring types.
-    2. Ragged rows — ``null_padding`` fills short rows, but DuckDB cannot
-       combine it with the parallel scanner when cells contain quoted newlines,
-       so this step also drops to a single-threaded read.
-    3. Everything as text — for a column whose type changes far enough into the
-       file that sampling missed it.
+    1. The fast path — DuckDB's parallel scanner, inferring types from a sample.
+    2. Types from every row — for a column whose type changes far enough into
+       the file that the sample missed it (an ``N/A`` at row 300,000). Only that
+       column becomes text.
+    3. Ragged rows — ``null_padding`` gives a short row empty cells and keeps a
+       long row's extra values in added columns, but DuckDB cannot combine it
+       with the parallel scanner when cells contain quoted newlines, so this
+       step also drops to a single-threaded read.
+    4. Everything as text.
+    5. Last resort — load every row that parses, and say how many did not and
+       on which lines.
 
-    Each escalation is recorded in ``notes``, so the user is told what happened
-    instead of quietly receiving a different result.
+    No step drops a row without saying so. The first attempt used to set
+    ``ignore_errors``, which "succeeded" by skipping every row that did not fit
+    — a 300,002-row file loaded as 300,000 with nothing said — so the remedies
+    below it never ran.
+
+    Each escalation is recorded in ``notes``, and any rows that could not be
+    read in ``warnings``, so the user is told what happened instead of quietly
+    receiving a different result.
     """
-    encoding = encoding or detect_encoding(path)
-    delimiter = delimiter or sniff_delimiter(_read_text_head(path, encoding, 131_072))
-
-    base = ["header = ?", "delim = ?", "encoding = ?", "ignore_errors = true",
-            "sample_size = 262144"]
+    base = ["header = ?", "delim = ?", "encoding = ?"]
     if date_format:
         base = base + [f"dateformat = {_literal(date_format)}",
                        f"timestampformat = {_literal(date_format)}"]
-    ragged = base + ["null_padding = true", "parallel = false"]
+    sampled = base + ["sample_size = 262144"]
+    every_row = base + ["sample_size = -1"]
+    ragged = every_row + ["null_padding = true", "parallel = false"]
+    as_text = ragged + ["all_varchar = true"]
+    ragged_note = (
+        "Some rows had a different number of values than the header. Missing "
+        "values were left empty, and extra values were kept in added columns."
+    )
+    text_note = "Some columns held a mix of types, so every column was read as text."
     attempts: list[tuple[list[str], str | None]] = [
-        (base, None),
-        (ragged, "Some rows had fewer values than the header; the gaps were left empty."),
-        (ragged + ["all_varchar = true"],
-         "Some columns held a mix of types, so every column was read as text."),
+        (sampled, None),
+        (every_row, "A column changed type far into the file, so column types were "
+                    "worked out from every row rather than from the first ones."),
+        (ragged, ragged_note),
+        (as_text, text_note),
     ]
     if all_varchar:
-        attempts = [(base + ["all_varchar = true"], None), attempts[2]]
+        attempts = [(sampled + ["all_varchar = true"], None), (as_text, ragged_note)]
 
-    params: list[Any] = [str(path), has_header, delimiter, encoding]
+    params: list[Any] = [glob_escape(path), has_header, delimiter, encoding]
     last: Exception | None = None
 
     for options, note in attempts:
@@ -553,7 +744,37 @@ def _ingest_csv(
             except duckdb.Error:
                 pass
 
-    raise IngestError(_friendly_duckdb_error(last or Exception("unknown")))
+    # No reader took every row. Rather than refuse the whole file, keep what
+    # parses and account for the rest by count and line number. The rejects
+    # table is temporary and belongs to this cursor, so it is read before the
+    # cursor closes.
+    cur = workspace.cursor()
+    try:
+        cur.execute(
+            f"CREATE OR REPLACE TABLE {ident(table)} AS "
+            f"SELECT * FROM read_csv(?, {', '.join(as_text + ['store_rejects = true'])})",
+            params,
+        )
+        skipped, lines = cur.execute(
+            "SELECT count(*), list(line ORDER BY line)[1:5] "
+            "FROM (SELECT DISTINCT line FROM reject_errors)"
+        ).fetchone()
+    except duckdb.Error as exc:
+        raise IngestError(_friendly_duckdb_error(last or exc)) from exc
+    finally:
+        try:
+            cur.close()
+        except duckdb.Error:
+            pass
+
+    notes.append(text_note)
+    if skipped:
+        shown = ", ".join(f"{n:,}" for n in lines or []) + (", …" if skipped > len(lines or []) else "")
+        warnings.append(
+            f"{skipped:,} row{'s' if skipped != 1 else ''} could not be read and "
+            f"{'were' if skipped != 1 else 'was'} left out (line {shown}). Everything "
+            "else was loaded; check those lines in a text editor."
+        )
 
 
 def _ingest_excel(
@@ -563,49 +784,154 @@ def _ingest_excel(
     *,
     sheet: str | None,
     has_header: bool,
+    all_varchar: bool = False,
     notes: list[str],
+    say: Any = None,
+    cancel: Any = None,
 ) -> None:
+    """Load one sheet of a workbook as a table of text, then retype it.
+
+    The sheet is streamed row by row into a temporary file that DuckDB reads in
+    one bulk step. The first version bound every cell as a query parameter, and
+    DuckDB 1.5 tries — and fails — to import pandas twice for each one: about a
+    millisecond per cell, so a 10,000 x 10 sheet took 106 seconds and a full one
+    hours, with the progress bar frozen and Cancel ignored. The names, text and
+    types that come out are exactly those the cell-by-cell version produced; only
+    the way the rows travel changed.
+    """
     from python_calamine import CalamineWorkbook
 
-    workbook = CalamineWorkbook.from_path(str(path))
-    sheet_name = sheet or (workbook.sheet_names[0] if workbook.sheet_names else None)
+    def check() -> None:
+        if cancel is not None and cancel.is_set():
+            raise IngestCancelled()
+
+    def report(detail: str, percent: float) -> None:
+        if say:
+            say("loading", detail, percent)
+
+    workbook = _calamine(lambda: CalamineWorkbook.from_path(str(path)),
+                         "That workbook could not be opened")
+    sheet_names = list(workbook.sheet_names)
+    sheet_name = sheet or (sheet_names[0] if sheet_names else None)
     if sheet_name is None:
         raise IngestError("That workbook has no sheets.")
-
-    rows = workbook.get_sheet_by_name(sheet_name).to_python(skip_empty_area=True)
-    rows = [r for r in rows if any(str(c).strip() for c in r)]
-    if not rows:
+    if sheet_name not in sheet_names:
+        raise IngestError(f"There is no sheet called “{sheet_name}” in that workbook.")
+    data = _calamine(lambda: workbook.get_sheet_by_name(sheet_name),
+                     f"Sheet “{sheet_name}” could not be read")
+    check()
+    # iter_rows panics on a sheet with no cells at all, so answer that here.
+    if not data.height:
         raise IngestError(f"Sheet “{sheet_name}” is empty.")
 
-    if has_header:
-        names = _unique_names([str(c).strip() or f"column{i + 1}" for i, c in enumerate(rows[0])])
-        body = rows[1:]
-    else:
-        names = [f"column{i + 1}" for i in range(len(rows[0]))]
-        body = rows
-
-    width = len(names)
-    # Excel sheets are ragged; pad and trim so every tuple matches the schema.
-    padded = [tuple(list(r[:width]) + [None] * (width - len(r[:width]))) for r in body]
-
+    # A value no cell can hold, standing for "no value": each field is written
+    # quoted, and DuckDB reads a quoted "" back as an empty string (which is what
+    # a blank cell always became) and this marker as NULL.
+    null = f"grande-null-{uuid.uuid4().hex}"
+    spill = workspace.spill_dir / f"excel-{os.getpid()}-{uuid.uuid4().hex[:8]}.csv"
+    expected = max(1, data.start[0] + data.height)  # iter_rows starts at the sheet's top row
+    names: list[str] | None = None
+    width = written = seen = longest = 0
     cur = workspace.cursor()
+    created = False
     try:
+        with open(spill, "w", encoding="utf-8", errors="replace", newline="") as handle:
+            out = csv.writer(handle, quoting=csv.QUOTE_ALL, lineterminator="\n")
+            last_report = time.monotonic()
+
+            def stream() -> None:
+                nonlocal names, width, written, seen, longest, last_report
+                for row in data.iter_rows():
+                    seen += 1
+                    if seen % 1000 == 0:
+                        check()
+                        now = time.monotonic()
+                        if now - last_report >= EXCEL_PROGRESS_SECONDS:
+                            last_report = now
+                            report(f"Reading row {seen:,} of {expected:,}",
+                                   12 + 58 * min(1.0, seen / expected))
+                    if _is_blank(row):
+                        continue
+                    if names is None:
+                        if has_header:
+                            names = _unique_names(
+                                [str(c).strip() or f"column{i + 1}" for i, c in enumerate(row)]
+                            )
+                            width = len(names)
+                            continue
+                        names = [f"column{i + 1}" for i in range(len(row))]
+                        width = len(names)
+                    # Trim and pad to the header's width, as before, and turn each
+                    # cell into the same text _excel_cell always produced.
+                    cells = [null if v is None else v if type(v) is str else _excel_cell(v)
+                             for v in row[:width]]
+                    if len(cells) < width:
+                        cells.extend([null] * (width - len(cells)))
+                    out.writerow(cells)
+                    written += 1
+                    size = sum(map(len, cells))
+                    if size > longest:
+                        longest = size
+
+            _calamine(stream, f"Sheet “{sheet_name}” could not be read")
+
+        if names is None:
+            raise IngestError(f"Sheet “{sheet_name}” is empty.")
+        check()
+
         columns_sql = ", ".join(f"{ident(n)} VARCHAR" for n in names)
         cur.execute(f"CREATE OR REPLACE TABLE {ident(table)} ({columns_sql})")
-        if padded:
-            placeholders = ", ".join("?" for _ in names)
-            cur.executemany(
-                f"INSERT INTO {ident(table)} VALUES ({placeholders})",
-                [tuple(_excel_cell(v) for v in row) for row in padded],
+        created = True
+        if written:
+            report(f"Loading {written:,} rows", 72)
+            spec = ", ".join(f"'c{i}': 'VARCHAR'" for i in range(width))
+            options = [
+                "header = false", "auto_detect = false", "delim = ','", "quote = '\"'",
+                "escape = '\"'", "encoding = 'utf-8'", f"nullstr = {_literal(null)}",
+                "allow_quoted_nulls = true", "strict_mode = true",
+                # Cells may hold newlines; the single-threaded reader is the one
+                # that is never confused by them.
+                "parallel = false", f"columns = {{{spec}}}",
+            ]
+            # UTF-8 is at most four bytes a character; add the quotes and commas.
+            line_bytes = longest * 4 + width * 3 + 16
+            if line_bytes > 2_000_000:
+                options.append(f"max_line_size = {line_bytes}")
+                options.append(f"buffer_size = {line_bytes * 2}")
+            cur.execute(
+                f"INSERT INTO {ident(table)} SELECT * FROM read_csv(?, {', '.join(options)})",
+                [glob_escape(spill)],
             )
-        # Everything arrived as text; let DuckDB re-infer real types where it can.
-        _retype_in_place(cur, table, names)
+            loaded = cur.execute(f"SELECT count(*) FROM {ident(table)}").fetchone()[0]
+            if loaded != written:
+                raise IngestError(
+                    f"Only {loaded:,} of the sheet's {written:,} rows could be loaded, so "
+                    "nothing was kept. Save the sheet as CSV and open that instead."
+                )
+        check()
+        if not all_varchar:
+            report("Working out column types", 74)
+            # Everything arrived as text; let DuckDB re-infer real types where it can.
+            _retype_in_place(cur, table, names, cancel=cancel)
+    except BaseException as exc:
+        if created:
+            try:
+                cur.execute(f"DROP TABLE IF EXISTS {ident(table)}")
+            except duckdb.Error:
+                pass
+        if isinstance(exc, duckdb.Error):
+            raise IngestError(_friendly_duckdb_error(exc)) from exc
+        raise
     finally:
         cur.close()
+        try:
+            spill.unlink()
+        except OSError:
+            pass
 
     notes.append(f"Loaded sheet “{sheet_name}”.")
-    if len(workbook.sheet_names) > 1:
-        notes.append(f"Other sheets available: {', '.join(n for n in workbook.sheet_names if n != sheet_name)}.")
+    if len(sheet_names) > 1:
+        notes.append(f"Other sheets available: {', '.join(n for n in sheet_names if n != sheet_name)}.")
 
 
 def _excel_cell(value: Any) -> Any:
@@ -618,19 +944,41 @@ def _excel_cell(value: Any) -> Any:
     return str(value)
 
 
-def _retype_in_place(cur: duckdb.DuckDBPyConnection, table: str, names: list[str]) -> None:
-    """Promote all-text columns to numbers/dates when every value converts cleanly.
+#: A column may take a type only if no value changes on the way. DuckDB's casts
+#: are more forgiving than that — TRY_CAST('1.25' AS BIGINT) is 1, and
+#: TRY_CAST('2024-03-15 10:30' AS DATE) drops the time — so every decimal column
+#: of every workbook was rounded to whole numbers, and every date-and-time column
+#: lost its times. Each target carries the test for a value it would alter.
+_LOSSY = {
+    # Whole numbers only, written plainly: Excel's 5.0 yes, 1.25 no.
+    "BIGINT": r"NOT regexp_matches({c}, '^\s*[+-]?[0-9]+(\.0*)?\s*$')",
+    # A double holds 17 significant digits. A longer number is an identifier,
+    # and making it a double would quietly change its last digits.
+    "DOUBLE": r"length(ltrim(replace(regexp_extract({c}, '^\s*[+-]?([0-9]*\.?[0-9]*)', 1), '.', ''), '0')) > 17",
+    # A date only when there is no time of day to lose.
+    "DATE": "TRY_CAST({c} AS TIMESTAMP) IS DISTINCT FROM CAST(TRY_CAST({c} AS DATE) AS TIMESTAMP)",
+    "TIMESTAMP": "FALSE",
+}
+
+
+def _retype_in_place(
+    cur: duckdb.DuckDBPyConnection, table: str, names: list[str], *, cancel: Any = None
+) -> None:
+    """Promote all-text columns to numbers/dates when every value converts losslessly.
 
     Done per column so one messy column cannot force the whole sheet back to text.
     """
     quoted = ident(table)
     for name in names:
+        if cancel is not None and cancel.is_set():
+            raise IngestCancelled()
         col = ident(name)
         for target in ("BIGINT", "DOUBLE", "DATE", "TIMESTAMP"):
+            lossy = _LOSSY[target].format(c=col)
             try:
                 row = cur.execute(
-                    f"SELECT count(*) FROM {quoted} "
-                    f"WHERE {col} IS NOT NULL AND TRY_CAST({col} AS {target}) IS NULL"
+                    f"SELECT count(*) FROM {quoted} WHERE {col} IS NOT NULL "
+                    f"AND (TRY_CAST({col} AS {target}) IS NULL OR {lossy})"
                 ).fetchone()
             except duckdb.Error:
                 break
@@ -657,16 +1005,22 @@ def _retype_in_place(cur: duckdb.DuckDBPyConnection, table: str, names: list[str
 
 
 def _unique_names(names: list[str]) -> list[str]:
-    """Make header names unique the way a spreadsheet would: name, name_2, name_3."""
-    seen: dict[str, int] = {}
+    """Make header names unique the way a spreadsheet would: name, name_2, name_3.
+
+    Compared without regard to case, because DuckDB column names are
+    case-insensitive: headers "ID" and "Id" made CREATE TABLE fail, and so did
+    "a", "a", "a_2", whose generated second name collided with the third.
+    Names that were already distinct come out unchanged.
+    """
+    taken: set[str] = set()
     out: list[str] = []
     for name in names:
-        if name not in seen:
-            seen[name] = 1
-            out.append(name)
-        else:
-            seen[name] += 1
-            out.append(f"{name}_{seen[name]}")
+        candidate, n = name, 1
+        while candidate.lower() in taken:
+            n += 1
+            candidate = f"{name}_{n}"
+        taken.add(candidate.lower())
+        out.append(candidate)
     return out
 
 

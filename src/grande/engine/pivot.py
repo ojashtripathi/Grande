@@ -30,6 +30,7 @@ most common pivot there is — cannot be built at all.
 
 from __future__ import annotations
 
+import math
 from datetime import date, datetime, timedelta
 from typing import Any, Sequence
 
@@ -480,7 +481,8 @@ def _ratio(numerator: Any, denominator: float | None) -> Any:
     value = _as_float(numerator)
     if value is None or not denominator:
         return None
-    return value / denominator
+    ratio = value / denominator
+    return ratio if math.isfinite(ratio) else None
 
 
 def _as_float(value: Any) -> float | None:
@@ -498,7 +500,9 @@ def _scalar(value: Any) -> Any:
     if isinstance(value, int):
         return value if abs(value) <= 9_007_199_254_740_991 else str(value)
     if isinstance(value, float):
-        return value
+        # No JSON form for NaN or infinity (an AVG over them, say): one such cell
+        # made the whole pivot reply unreadable and the view sat on "Calculating…".
+        return value if math.isfinite(value) else None
     from decimal import Decimal
 
     if isinstance(value, Decimal):

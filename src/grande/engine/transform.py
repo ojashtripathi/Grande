@@ -214,8 +214,11 @@ def find_replace(
     workspace: Workspace,
     dataset: Dataset,
     *,
-    columns: Sequence[str] | None,
-    find: str,
+    # Every argument here has a default. The UI omits a field the user left
+    # empty, so a required keyword arrives as a TypeError — an internal 500
+    # where the user should simply have been told what to choose.
+    columns: Sequence[str] | None = None,
+    find: str = "",
     replace: str = "",
     match_case: bool = False,
     whole_cell: bool = False,
@@ -279,7 +282,7 @@ def clean_text(
     workspace: Workspace,
     dataset: Dataset,
     *,
-    columns: Sequence[str],
+    columns: Sequence[str] | None = None,
     trim: bool = True,
     collapse_spaces: bool = False,
     case: str | None = None,
@@ -336,12 +339,14 @@ def split_column(
     workspace: Workspace,
     dataset: Dataset,
     *,
-    column: str,
-    delimiter: str,
+    column: str = "",
+    delimiter: str = "",
     into: int = 2,
     keep_original: bool = False,
 ) -> Dataset:
     """Excel's Text to Columns."""
+    if not column:
+        raise TransformError("Choose a column to split.")
     _check(dataset, column)
     if not delimiter:
         raise TransformError("Choose what to split on.")
@@ -393,6 +398,20 @@ _NAMED = [
 ]
 _COMPACT = ["%Y%m%d", "%Y%m%d%H%M%S"]
 
+#: What an export wraps a number in, removed before it is read (RE2 syntax).
+#: Currency codes only as a separate word, so "SKU-123" keeps its letters.
+_CURRENCY_CODES = "USD|EUR|GBP|ILS|NIS|JPY|CHF|CAD|AUD|INR|CNY|SEK|NOK|DKK|PLN|CZK|HUF|MXN|BRL|ZAR"
+_NUMBER_WRAPPING = (
+    rf"^({_CURRENCY_CODES})\s+|\s+({_CURRENCY_CODES})$"
+    r"|[\s\x{00A0}\x{202F}'’$€£¥₪%()]|-\s*$"
+)
+#: 1,234 / 1,234,567.89 — commas are thousands (the usual reading of 1,234).
+_COMMA_THOUSANDS = r"^[+-]?\d{1,3}(,\d{3})+(\.\d+)?$"
+#: 1.234,56 / 1.234.567 — dots are thousands; a lone 1.234 stays a decimal.
+_DOT_THOUSANDS = r"^[+-]?\d{1,3}(\.\d{3})+,\d+$|^[+-]?\d{1,3}(\.\d{3}){2,}$"
+#: 12,5 / 1234,56 — the comma is the decimal point.
+_DECIMAL_COMMA = r"^[+-]?\d*,\d+$"
+
 TYPE_TARGETS = {
     "text": "VARCHAR", "number": "DOUBLE", "integer": "BIGINT",
     "date": "DATE", "datetime": "TIMESTAMP", "boolean": "BOOLEAN",
@@ -434,10 +453,24 @@ def _cast_expression(
         )
 
     if sql_type in {"DOUBLE", "BIGINT"}:
-        # Strip the thousands separators, currency symbols and trailing minus
-        # signs that spreadsheet exports carry.
+        # Strip what exports wrap a number in (currency marks and codes, spaces,
+        # apostrophe thousands, percent signs, accounting parentheses, a
+        # trailing minus) but never letters inside the value: "SKU-123" must
+        # fail and be listed, not become -123.
+        bare = f"regexp_replace({text}, {literal(_NUMBER_WRAPPING)}, '', 'g')"
+        # Then decide which mark is the decimal point. Stripping every comma
+        # turned 12,5 into 125 and 1.234,56 into 1.23456, both counted as
+        # converted. Commas grouping threes (1,234,567.8) are thousands; dots
+        # grouping threes before a comma (1.234,56) are too; any other comma
+        # (12,5 or 1234,56) is a decimal point.
         cleaned = (
-            f"regexp_replace({text}, '[^0-9eE+.\\-]', '', 'g')"
+            f"CASE WHEN regexp_matches({bare}, {literal(_COMMA_THOUSANDS)}) "
+            f"THEN replace({bare}, ',', '') "
+            f"WHEN regexp_matches({bare}, {literal(_DOT_THOUSANDS)}) "
+            f"THEN replace(replace({bare}, '.', ''), ',', '.') "
+            f"WHEN regexp_matches({bare}, {literal(_DECIMAL_COMMA)}) "
+            f"THEN replace({bare}, ',', '.') "
+            f"ELSE {bare} END"
         )
         negative = f"regexp_matches({text}, '^\\(.*\\)$|-\\s*$')"
         magnitude = f"TRY_CAST({cleaned} AS {sql_type})"
@@ -453,8 +486,8 @@ def preview_change_type(
     workspace: Workspace,
     dataset: Dataset,
     *,
-    column: str,
-    to: str,
+    column: str = "",
+    to: str = "",
     date_format: str | None = None,
     day_first: bool = True,
 ) -> dict[str, Any]:
@@ -464,6 +497,8 @@ def preview_change_type(
     user can see the actual offenders), and whether a day-first or month-first
     reading would disagree.
     """
+    if not column:
+        raise TransformError("Choose a column to convert.")
     _check(dataset, column)
     sql_type = TYPE_TARGETS.get(str(to).lower())
     if sql_type is None:
@@ -531,8 +566,8 @@ def change_type(
     workspace: Workspace,
     dataset: Dataset,
     *,
-    column: str,
-    to: str,
+    column: str = "",
+    to: str = "",
     date_format: str | None = None,
     day_first: bool = True,
     keep_original: bool = False,
@@ -542,6 +577,8 @@ def change_type(
     ``keep_original`` copies the untouched values into a second column first, so
     a conversion that loses something is recoverable without an undo.
     """
+    if not column:
+        raise TransformError("Choose a column to convert.")
     _check(dataset, column)
     sql_type = TYPE_TARGETS.get(str(to).lower())
     if sql_type is None:
@@ -582,7 +619,11 @@ def change_type(
     return _apply(workspace, dataset, ", ".join(parts), step)
 
 
-def rename_column(workspace: Workspace, dataset: Dataset, *, column: str, to: str) -> Dataset:
+def rename_column(
+    workspace: Workspace, dataset: Dataset, *, column: str = "", to: str = ""
+) -> Dataset:
+    if not column:
+        raise TransformError("Choose a column to rename.")
     _check(dataset, column)
     new_name = str(to or "").strip()
     if not new_name:
@@ -601,8 +642,12 @@ def rename_column(workspace: Workspace, dataset: Dataset, *, column: str, to: st
     return _apply(workspace, dataset, ", ".join(parts), step)
 
 
-def remove_columns(workspace: Workspace, dataset: Dataset, *, columns: Sequence[str]) -> Dataset:
+def remove_columns(
+    workspace: Workspace, dataset: Dataset, *, columns: Sequence[str] | None = None
+) -> Dataset:
     drop = set(columns or [])
+    if not drop:
+        raise TransformError("Choose at least one column to delete.")
     _check(dataset, *drop)
     keep = [c for c in _all_columns(dataset) if c not in drop]
     if not keep:
@@ -616,9 +661,12 @@ def remove_columns(workspace: Workspace, dataset: Dataset, *, columns: Sequence[
 
 
 def fill_blanks(
-    workspace: Workspace, dataset: Dataset, *, columns: Sequence[str], value: str = ""
+    workspace: Workspace, dataset: Dataset, *,
+    columns: Sequence[str] | None = None, value: str = ""
 ) -> Dataset:
     targets = list(columns or [])
+    if not targets:
+        raise TransformError("Choose at least one column to fill.")
     _check(dataset, *targets)
     parts = []
     for col in _all_columns(dataset):
@@ -635,14 +683,19 @@ def fill_blanks(
 
 
 def keep_filtered(
-    workspace: Workspace, dataset: Dataset, *, filters: Sequence[dict], invert: bool = False
+    workspace: Workspace, dataset: Dataset, *,
+    filters: Sequence[dict] | None = None, invert: bool = False
 ) -> Dataset:
     """Turn the current filter into a permanent edit — keep or delete those rows."""
     where, params = compile_filters(filters)
     if not where:
         raise TransformError("Set a filter first.")
     clause = where[len(" WHERE "):]
-    predicate = f"NOT ({clause})" if invert else clause
+    # A row whose filter column is blank did not match, so deleting the matches
+    # must keep it. NOT (NULL) is NULL, and WHERE NULL drops the row, so the
+    # bare negation also deleted every blank row.
+    matched = f"coalesce(({clause}), false)"
+    predicate = f"NOT {matched}" if invert else matched
 
     new_table = workspace.new_table_name()
     cur = workspace.cursor()

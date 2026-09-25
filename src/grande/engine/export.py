@@ -40,7 +40,7 @@ from .filters import compile_filters
 from .ingest import EXCEL_MAX_COLS, EXCEL_MAX_DATA_ROWS
 from .query import _order_clause, _select_list
 from .session import Dataset, Workspace
-from .sql import ident
+from .sql import glob_escape, ident
 
 #: Excel refuses a cell longer than this.
 MAX_CELL_CHARS = 32_767
@@ -67,8 +67,23 @@ class ExportPlan:
     filenames: list[str]
     directory: str
     warnings: list[str] = field(default_factory=list)
+    #: Planned names that are already in the folder, and would be replaced.
+    existing: list[str] = field(default_factory=list)
+    #: The planned name that *is* the file the dataset was opened from, if any.
+    replaces_source: str | None = None
+
+    def replacement_warning(self) -> str | None:
+        """What an export here would replace, said before it runs."""
+        if self.replaces_source:
+            return f"{self.replaces_source} is the file you opened — exporting here would replace it."
+        if self.existing:
+            return (f"{_name_list(self.existing)} already "
+                    f"{'exists' if len(self.existing) == 1 else 'exist'} in that folder "
+                    "and would be replaced.")
+        return None
 
     def as_dict(self) -> dict[str, Any]:
+        replacing = self.replacement_warning()
         return {
             "row_count": self.row_count,
             "column_count": self.column_count,
@@ -76,7 +91,9 @@ class ExportPlan:
             "part_count": self.part_count,
             "filenames": self.filenames,
             "directory": self.directory,
-            "warnings": self.warnings,
+            "warnings": ([replacing] if replacing else []) + self.warnings,
+            "existing": self.existing,
+            "replaces_source": self.replaces_source,
         }
 
 
@@ -152,14 +169,78 @@ def plan_export(
     if parts > 200:
         warnings.append(f"This will create {parts:,} files. Consider a larger rows-per-file value.")
 
+    filenames = plan_filenames(base, parts, suffix_style, extension)
+    existing, source = _already_there(Path(directory).expanduser(), filenames, dataset.source_path)
+
     return ExportPlan(
         row_count=total,
         column_count=len(names),
         rows_per_file=rows_per_file,
         part_count=parts,
-        filenames=plan_filenames(base, parts, suffix_style, extension),
+        filenames=filenames,
         directory=str(directory),
         warnings=warnings,
+        existing=existing,
+        replaces_source=source,
+    )
+
+
+def _already_there(
+    directory: Path, filenames: Sequence[str], source_path: str
+) -> tuple[list[str], str | None]:
+    """Which planned files exist already, and which of them is the source.
+
+    ``samefile`` rather than comparing text, so a difference in case or in
+    slashes still recognises the source on Windows.
+    """
+    existing = [name for name in filenames if (directory / name).exists()]
+    for name in existing:
+        try:
+            if source_path and os.path.samefile(directory / name, source_path):
+                return existing, name
+        except OSError:
+            continue
+    return existing, None
+
+
+def _name_list(names: Sequence[str]) -> str:
+    shown = ", ".join(names[:3])
+    return shown + (f" and {len(names) - 3:,} more" if len(names) > 3 else "")
+
+
+def _export_warnings(plan: ExportPlan) -> list[str]:
+    """The plan's warnings for a finished export, saying what it replaced.
+
+    An export only gets this far with existing files when replacing them was
+    confirmed, so "would be replaced" has become "replaced".
+    """
+    if plan.replaces_source:
+        done = [f"Replaced {plan.replaces_source}, the file you opened."]
+    elif plan.existing:
+        done = [f"Replaced {_name_list(plan.existing)}, which "
+                f"{'was' if len(plan.existing) == 1 else 'were'} already in that folder."]
+    else:
+        done = []
+    return done + list(plan.warnings)
+
+
+def _refuse_to_overwrite(plan: ExportPlan, overwrite: bool) -> None:
+    """Never replace a file unless the caller said it may be replaced.
+
+    The export form proposes the source file's own folder and name, so without
+    this a same-format export silently wrote over the user's original.
+    """
+    if overwrite or not plan.existing:
+        return
+    if plan.replaces_source:
+        raise ExportError(
+            f"That would replace {plan.replaces_source}, the file you opened, so "
+            "nothing was written. Choose a different file name or folder."
+        )
+    raise ExportError(
+        f"{_name_list(plan.existing)} already "
+        f"{'exists' if len(plan.existing) == 1 else 'exist'} in that folder, so "
+        "nothing was written. Choose a different file name or folder."
     )
 
 
@@ -254,7 +335,7 @@ def stage_view(
             params,
         )
         described = cur.execute(
-            "DESCRIBE SELECT * FROM read_parquet(?)", [str(staging_path)]
+            "DESCRIBE SELECT * FROM read_parquet(?)", [glob_escape(staging_path)]
         ).fetchall()
     except duckdb.Error as exc:
         raise ExportError(f"The data could not be prepared for export: {exc}") from exc
@@ -287,7 +368,8 @@ def _write_xlsx_part(job: dict[str, Any]) -> dict[str, Any]:
     con = duckdb.connect()
     _quiet(con)
     cursor = con.execute(
-        f"SELECT * FROM read_parquet({_sql_path(staging)}) LIMIT {count} OFFSET {offset}"
+        f"SELECT * FROM read_parquet({_sql_path(glob_escape(staging))}) "
+        f"LIMIT {count} OFFSET {offset}"
     )
 
     workbook = xlsxwriter.Workbook(
@@ -423,7 +505,7 @@ def _write_xlsx_part_duckdb(job: dict[str, Any]) -> dict[str, Any]:
         _quiet(con)
         con.execute("LOAD excel")
         con.execute(
-            f"COPY (SELECT * FROM read_parquet({_sql_path(job['staging'])}) "
+            f"COPY (SELECT * FROM read_parquet({_sql_path(glob_escape(job['staging']))}) "
             f"LIMIT {job['count']} OFFSET {job['offset']}) "
             f"TO {_sql_path(job['path'])} (FORMAT xlsx, HEADER true)"
         )
@@ -481,8 +563,12 @@ def export_excel(
     cancel: Any = None,
     max_workers: int | None = None,
     fast_writer: bool | None = None,
+    overwrite: bool = False,
 ) -> dict[str, Any]:
-    """Export the current view as one or more .xlsx files."""
+    """Export the current view as one or more .xlsx files.
+
+    Files already in the folder are replaced only when ``overwrite`` is set.
+    """
     out_dir = Path(directory).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
     if not os.access(out_dir, os.W_OK):
@@ -493,6 +579,7 @@ def export_excel(
         directory=str(out_dir), base_name=base_name, rows_per_file=rows_per_file,
         suffix_style=suffix_style, filters=filters, columns=columns, extension=".xlsx",
     )
+    _refuse_to_overwrite(plan, overwrite)
 
     def say(**payload: Any) -> None:
         if progress:
@@ -546,7 +633,7 @@ def export_excel(
             for r in sorted(results, key=lambda r: r["index"])
         ]
         truncated = sum(r.get("truncated_cells", 0) for r in results)
-        warnings = list(plan.warnings)
+        warnings = _export_warnings(plan)
         if forced:
             warnings.append(
                 f"{', '.join(forced)} {'contains' if len(forced) == 1 else 'contain'} "
@@ -688,8 +775,12 @@ def export_flat(
     suffix_style: str = "alpha",
     compression: str = "zstd",
     progress: Callable[[dict[str, Any]], None] | None = None,
+    overwrite: bool = False,
 ) -> dict[str, Any]:
-    """Export to CSV, Parquet, JSON or Arrow — optionally split into parts too."""
+    """Export to CSV, Parquet, JSON or Arrow — optionally split into parts too.
+
+    Files already in the folder are replaced only when ``overwrite`` is set.
+    """
     fmt = (fmt or "csv").lower()
     extensions = {"csv": ".csv", "tsv": ".tsv", "parquet": ".parquet", "json": ".jsonl", "arrow": ".arrow"}
     if fmt not in extensions:
@@ -706,6 +797,7 @@ def export_flat(
         suffix_style=suffix_style, filters=filters, columns=columns,
         extension=extensions[fmt],
     )
+    _refuse_to_overwrite(plan, overwrite)
 
     select_sql, _ = _select_list(dataset, columns)
     where, params = compile_filters(filters)
@@ -757,5 +849,5 @@ def export_flat(
         "seconds": round(elapsed, 2),
         "bytes": written,
         "compression_ratio": round(1 - written / source_bytes, 3) if source_bytes and written else None,
-        "warnings": plan.warnings,
+        "warnings": _export_warnings(plan),
     }

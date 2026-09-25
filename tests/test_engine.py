@@ -525,6 +525,9 @@ def test_excel_input_roundtrip(workspace, dataset, tmp_path):
     assert reopened.row_count == len(ROWS)
     assert [c.name for c in reopened.columns] == HEADER
     assert reopened.column("account").kind == "text", "leading zeros lost on reload"
+    # Regression: decimal columns came back rounded to whole numbers.
+    amounts = [r[0] for r in workspace.execute(f"SELECT amount FROM {reopened.relation} ORDER BY rowid")]
+    assert amounts == [float(r[2]) for r in ROWS]
 
 
 def test_semicolon_file_is_detected(workspace, tmp_path):
@@ -743,3 +746,165 @@ def test_messy_numbers_convert(tmp_path):
         assert values == pytest.approx([1234.50, 2000.0, -1500.0, 42.0])
     finally:
         ws.close()
+
+
+# ------------------------------------------------------------- the SQL console
+
+
+def test_sql_console_allows_reads():
+    from grande.engine.sql import check_read_only
+
+    for statement in ("SELECT * FROM data",
+                      "  with x as (select 1) select * from x  ",
+                      "DESCRIBE data",
+                      "SUMMARIZE data",
+                      "SELECT * FROM data; "):
+        assert check_read_only(statement)
+
+
+def test_sql_console_refuses_writes():
+    from grande.engine.sql import check_read_only
+
+    for statement in ("COPY data TO 'x.csv'",
+                      "INSTALL httpfs",
+                      "ATTACH 'other.db'",
+                      "DROP TABLE data",
+                      "CREATE TABLE t AS SELECT 1",
+                      "SET disabled_filesystems = ''",
+                      "SELECT 1; DROP TABLE data"):
+        with pytest.raises(SqlError):
+            check_read_only(statement)
+
+
+def test_a_value_that_looks_like_a_keyword_is_fine():
+    """The check reads the statement, so a literal must not trip it."""
+    from grande.engine.sql import check_read_only
+
+    assert check_read_only("SELECT * FROM data WHERE note = 'please delete this'")
+    assert check_read_only("SELECT * FROM data -- drop everything")
+
+
+def test_running_sql_does_not_break_opening_files(tmp_path):
+    """Regression: the console used to sandbox itself with
+
+        SET disabled_filesystems = 'LocalFileSystem'
+
+    which is global to the DuckDB instance. One query and every later file open
+    failed with a permission error until Grande was restarted.
+    """
+    ws = Workspace(tmp_path / "ws_sqlfs")
+    try:
+        first = ingest(ws, _typed(tmp_path, "one", ["a", "b"]))
+        assert first.row_count == 2
+
+        cur = ws.cursor()
+        try:
+            cur.execute(f"SELECT count(*) FROM {first.relation}").fetchone()
+        finally:
+            cur.close()
+
+        second = ingest(ws, _typed(tmp_path, "two", ["c", "d"]))
+        assert second.row_count == 2, "a file must still be openable after a query"
+    finally:
+        ws.close()
+
+
+# ------------------------------------------------------ review regressions
+
+
+def test_deleting_matches_keeps_rows_the_filter_did_not_match(tmp_path):
+    """Regression: NOT (rev > 100) is NULL for a blank rev, so 'Delete matching
+    rows' deleted every blank row along with the matches."""
+    ws = Workspace(tmp_path / "ws_invert")
+    try:
+        path = tmp_path / "rev.csv"
+        path.write_text("id,rev\n1,50\n2,500\n3,\n4,20\n", encoding="utf-8")
+        ds = ingest(ws, path)
+        rule = [{"column": "rev", "op": "gt", "value": 100}]
+        transform_engine.keep_filtered(ws, ds, filters=rule, invert=True)
+        ids = [r[0] for r in query_engine.page(ws, ds, limit=10, columns=["id"])["rows"]]
+        assert sorted(ids) == [1, 3, 4]
+
+        transform_engine.undo(ws, ds)
+        transform_engine.keep_filtered(ws, ds, filters=rule)
+        ids = [r[0] for r in query_engine.page(ws, ds, limit=10, columns=["id"])["rows"]]
+        assert ids == [2]
+    finally:
+        ws.close()
+
+
+def test_decimal_commas_are_read_as_decimals(tmp_path):
+    """Regression: every comma was stripped, so 12,5 became 125 and 1.234,56
+    became 1.23456 — counted as converted — and 'SKU-123' became -123."""
+    ws = Workspace(tmp_path / "ws_eu")
+    try:
+        values = ["12,5", "1.234,56", "0,75", "(1.234,56)", "1.234", "1,234", "€ 3,5"]
+        ds = ingest(ws, _typed(tmp_path, "eu", values + ["SKU-123"]))
+        preview = transform_engine.preview_change_type(ws, ds, column="value", to="number")
+        assert [f["value"] for f in preview["failures"]] == ["SKU-123"]
+        transform_engine.change_type(ws, ds, column="value", to="number")
+        got = [r[0] for r in query_engine.page(ws, ds, limit=10, columns=["value"])["rows"]]
+        assert got[:-1] == pytest.approx([12.5, 1234.56, 0.75, -1234.56, 1.234, 1234.0, 3.5])
+        assert got[-1] is None
+    finally:
+        ws.close()
+
+
+def test_export_never_replaces_the_source_unasked(workspace, dataset, source):
+    """Regression: the form proposes the source's folder and name, and a
+    same-format export silently wrote over the user's original file."""
+    original = source.read_bytes()
+    plan = export_engine.plan_export(
+        workspace, dataset, directory=str(source.parent), base_name="ledger", extension=".csv",
+    )
+    assert plan.existing == ["ledger.csv"]
+    assert plan.replaces_source == "ledger.csv"
+    assert "would replace it" in plan.as_dict()["warnings"][0]
+
+    with pytest.raises(export_engine.ExportError, match="file you opened"):
+        export_engine.export_flat(
+            workspace, dataset, directory=str(source.parent), base_name="ledger", fmt="csv",
+            filters=[{"column": "item", "op": "in", "values": ["Sale"]}],
+        )
+    assert source.read_bytes() == original
+
+    result = export_engine.export_flat(
+        workspace, dataset, directory=str(source.parent), base_name="ledger", fmt="csv",
+        overwrite=True,
+    )
+    assert source.read_bytes() != original
+    assert result["warnings"][0] == "Replaced ledger.csv, the file you opened."
+
+
+@pytest.mark.parametrize("fast", [False, True])
+def test_excel_export_asks_before_replacing(workspace, dataset, tmp_path, fast):
+    if fast and not export_engine.excel_writer_available():
+        pytest.skip("DuckDB excel extension not available")
+    out = tmp_path / "out"
+    export_engine.export_excel(
+        workspace, dataset, directory=str(out), base_name="book", fast_writer=fast,
+    )
+    before = (out / "book.xlsx").stat().st_mtime_ns
+    with pytest.raises(export_engine.ExportError, match="already exists"):
+        export_engine.export_excel(
+            workspace, dataset, directory=str(out), base_name="book", fast_writer=fast,
+        )
+    assert (out / "book.xlsx").stat().st_mtime_ns == before
+    result = export_engine.export_excel(
+        workspace, dataset, directory=str(out), base_name="book", fast_writer=fast,
+        overwrite=True,
+    )
+    assert result["status"] == "ok"
+
+
+@pytest.mark.parametrize("fast", [False, True])
+def test_excel_export_into_a_bracketed_folder(workspace, dataset, tmp_path, fast):
+    """The staging file is read back by path, and DuckDB globs paths."""
+    if fast and not export_engine.excel_writer_available():
+        pytest.skip("DuckDB excel extension not available")
+    out = tmp_path / "exports [2024]"
+    result = export_engine.export_excel(
+        workspace, dataset, directory=str(out), base_name="book", fast_writer=fast,
+    )
+    assert result["row_count"] == len(ROWS)
+    assert (out / "book.xlsx").exists()

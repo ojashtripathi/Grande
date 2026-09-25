@@ -8,6 +8,7 @@ parameter instead; nothing user-supplied is ever pasted in raw.
 
 from __future__ import annotations
 
+import re
 from typing import Iterable
 
 #: Aggregators the UI may ask for, mapped to a SQL template.
@@ -104,6 +105,21 @@ def agg_expr(aggregator: str, column: str | None) -> str:
     return template.format(c=ident(column))
 
 
+def glob_escape(path: object) -> str:
+    """A filesystem path as DuckDB's file readers will take it *literally*.
+
+    ``read_csv``, ``read_parquet``, ``read_json_auto`` and ``sniff_csv`` treat
+    their path as a glob pattern, so a real file named ``report[2024].csv``
+    loaded ``report2.csv`` instead — or several such files, concatenated —
+    whenever one sat in the same folder. Wrapping each metacharacter in a
+    one-character class makes it match only itself.
+
+    >>> glob_escape('C:/data/report[2024].csv')
+    'C:/data/report[[]2024[]].csv'
+    """
+    return re.sub(r"([\[\]*?])", r"[\1]", str(path))
+
+
 def numeric_cast(column: str) -> str:
     """Cast a column to DOUBLE for aggregation, yielding NULL rather than failing.
 
@@ -111,6 +127,65 @@ def numeric_cast(column: str) -> str:
     on the messy exports this tool exists to open.
     """
     return f"TRY_CAST({ident(column)} AS DOUBLE)"
+
+
+#: Statements the SQL console may begin with.
+_READ_ONLY_STARTS = {
+    "select", "with", "describe", "desc", "show", "explain", "summarize",
+    "table", "values", "from", "pivot", "unpivot",
+}
+
+#: Words that make a statement do more than read. ``COPY`` writes files,
+#: ``ATTACH``/``INSTALL``/``LOAD`` reach outside the workspace, and the DDL/DML
+#: verbs would edit the user's loaded data behind the app's back.
+_FORBIDDEN = {
+    "copy", "attach", "detach", "install", "load", "export", "import",
+    "insert", "update", "delete", "drop", "alter", "create", "replace",
+    "call", "set", "reset", "pragma", "vacuum", "checkpoint", "truncate",
+    "grant", "revoke", "begin", "commit", "rollback",
+}
+
+_COMMENT = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
+_STRING = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"", re.DOTALL)
+_WORD = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
+
+
+def check_read_only(statement: str) -> str:
+    """Return a single read-only statement, or explain why it is refused.
+
+    The console used to be sandboxed with ``SET disabled_filesystems``, which is
+    a *global* DuckDB setting: running one query disabled file access for the
+    whole process, so no file could be opened afterwards until Grande was
+    restarted. Reading the statement is both correct and harmless.
+    """
+    text = (statement or "").strip()
+    if not text:
+        raise SqlError("Write a query first.")
+
+    # Look at the statement with comments and string literals removed, so a
+    # value like 'please delete this' cannot trip the checks below.
+    bare = _STRING.sub("''", _COMMENT.sub(" ", text))
+    trimmed = bare.strip().rstrip(";")
+    if ";" in trimmed:
+        raise SqlError("Run one statement at a time.")
+
+    words = [w.lower() for w in _WORD.findall(trimmed)]
+    if not words:
+        raise SqlError("Write a query first.")
+    if words[0] not in _READ_ONLY_STARTS:
+        raise SqlError(
+            f"Only queries that read data are allowed here, so a statement "
+            f"cannot start with “{words[0].upper()}”. "
+            "Use the Clean tab to change your data."
+        )
+    for word in words:
+        if word in _FORBIDDEN:
+            raise SqlError(
+                f"“{word.upper()}” is not allowed in the SQL box — it would "
+                "change something rather than read it. Use the Clean and Export "
+                "tabs for that."
+            )
+    return text.rstrip().rstrip(";")
 
 
 def sort_direction(direction: str | None) -> str:

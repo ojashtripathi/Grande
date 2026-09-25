@@ -93,6 +93,15 @@ export function mountPivot() {
 
 const hasLayout = () => layout.rows.length || layout.columns.length || layout.values.length;
 
+/**
+ * A stable key for one row group, used to remember what is collapsed.
+ *
+ * JSON rather than joining on a sentinel character: a sentinel can appear
+ * inside a real value, and picking an "impossible" one invites exactly the
+ * escaping mistakes that put raw NUL bytes in this file once already.
+ */
+const keyOf = (path) => JSON.stringify(path);
+
 function togglePane() {
   const pane = $('#pivot-pane');
   pane.classList.toggle('collapsed');
@@ -436,7 +445,7 @@ function collapseAll() {
   const walk = (nodes) => {
     for (const node of nodes.values()) {
       if (node.children.size) {
-        collapsed.add(node.path.join(' '));
+        collapsed.add(keyOf(node.path));
         walk(node.children);
       }
     }
@@ -653,7 +662,7 @@ function render() {
   const tree = buildTree(result.rows, rowFields.length);
 
   const emit = (node, level) => {
-    const key = node.path.join(' ');
+    const key = keyOf(node.path);
     const isCollapsed = collapsed.has(key);
     const hasChildren = node.children.size > 0;
     const tr = el('tr', { class: hasChildren ? 'subtotal' : '' });
@@ -815,12 +824,17 @@ async function drill(node, meta) {
       filters: allFilters(),
       limit: 200,
     });
-    const table = el('table', { class: 'grid', style: { position: 'static', tableLayout: 'auto', width: '100%' } },
-      el('thead', {}, el('tr', {}, ...data.columns.map((n) =>
-        el('th', {}, el('div', { class: 'th-inner', style: { cursor: 'default' } }, n))))),
+    const table = el('table', { class: 'result' },
+      el('thead', {}, el('tr', {}, ...data.columns.map((n) => el('th', { title: n }, n)))),
       el('tbody', {}, ...data.rows.map((record) =>
-        el('tr', {}, ...record.map((v) =>
-          el('td', { title: String(v ?? '') }, v === null ? '—' : String(v)))))));
+        el('tr', {}, ...record.map((v) => {
+          const empty = v === null || v === undefined;
+          const numeric = typeof v === 'number';
+          return el('td', {
+            class: [numeric ? 'num' : '', empty ? 'null' : ''].filter(Boolean).join(' '),
+            title: empty ? '' : String(v),
+          }, empty ? '—' : (numeric ? num(v) : String(v)));
+        })))));
     body.replaceChildren(
       el('div', { class: 'hint', style: { marginBottom: '10px' } },
         `${count(data.filtered_rows ?? data.returned)} rows — showing the first ${count(data.returned)}.`),
@@ -875,7 +889,7 @@ async function exportPivot() {
         ? ['  '.repeat(level) + label]
         : rowFields.map((f, i) => (i === level ? label : ''));
       lines.push([...labels, ...(node.row?.cells || []).map((c) => (c ?? ''))]);
-      if (node.children.size && !collapsed.has(node.path.join(' '))) {
+      if (node.children.size && !collapsed.has(keyOf(node.path))) {
         walk(node.children, level + 1);
       }
     }

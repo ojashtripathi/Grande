@@ -9,7 +9,7 @@ SQL, writing workbooks — because a plain GET needs no CORS preflight.
 
 from __future__ import annotations
 
-import json
+import math
 import secrets
 import os
 import platform
@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from flask import Flask, Response, jsonify, request, send_from_directory
+from flask.json.provider import DefaultJSONProvider
 from werkzeug.exceptions import HTTPException
 
 from .. import APP_NAME, __version__
@@ -29,7 +30,7 @@ from ..engine import transform as transform_engine
 from ..engine.filters import describe_filter
 from ..engine.jobs import JobRunner
 from ..engine.session import Workspace
-from ..engine.sql import SqlError
+from ..engine.sql import SqlError, check_read_only
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -46,6 +47,35 @@ class ApiError(Exception):
         self.status = status
 
 
+class FiniteJSONProvider(DefaultJSONProvider):
+    """JSON a browser can always read.
+
+    Python writes a float NaN or infinity as a bare ``NaN`` / ``Infinity``,
+    which is not JSON: the browser's JSON.parse rejects the whole reply, and a
+    page waiting on it simply stops. Values are made finite where they leave
+    the engine; this is the backstop for anything that slips past, and costs
+    nothing when the data is clean.
+    """
+
+    def dumps(self, obj: Any, **kwargs: Any) -> str:
+        kwargs.setdefault("allow_nan", False)
+        try:
+            return super().dumps(obj, **kwargs)
+        except ValueError:
+            return super().dumps(_finite(obj), **kwargs)
+
+
+def _finite(value: Any) -> Any:
+    """``value`` with every NaN and infinity replaced by None (JSON null)."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _finite(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite(item) for item in value]
+    return value
+
+
 def create_app(
     *,
     workspace: str | None = None,
@@ -53,6 +83,7 @@ def create_app(
     initial_file: str | None = None,
 ) -> Flask:
     app = Flask(__name__, static_folder=None)
+    app.json = FiniteJSONProvider(app)
     app.config["JSON_SORT_KEYS"] = False
 
     ws = Workspace(workspace)
@@ -199,22 +230,28 @@ def create_app(
         path = _require(body, "path")
         title = Path(path).name
 
-        def work(job: Any) -> dict[str, Any]:
-            def report(phase: str, detail: str) -> None:
-                percent = {"reading": 10, "indexing": 75, "done": 100}.get(phase, 40)
+        def work(job: Any) -> dict[str, Any] | None:
+            def report(phase: str, detail: str, percent: float | None = None) -> None:
+                if percent is None:
+                    percent = {"reading": 10, "indexing": 75, "done": 100}.get(phase, 40)
                 job.emit(percent=percent, message=detail, phase=phase)
 
-            dataset = ingest_engine.ingest(
-                ws, path,
-                kind=body.get("kind"),
-                delimiter=body.get("delimiter"),
-                encoding=body.get("encoding"),
-                has_header=bool(body.get("has_header", True)),
-                sheet=body.get("sheet"),
-                all_varchar=bool(body.get("all_varchar", False)),
-                date_format=body.get("date_format") or None,
-                progress=report,
-            )
+            try:
+                dataset = ingest_engine.ingest(
+                    ws, path,
+                    kind=body.get("kind"),
+                    delimiter=body.get("delimiter"),
+                    encoding=body.get("encoding"),
+                    has_header=bool(body.get("has_header", True)),
+                    sheet=body.get("sheet"),
+                    all_varchar=bool(body.get("all_varchar", False)),
+                    date_format=body.get("date_format") or None,
+                    progress=report,
+                    cancel=job.cancel_token,
+                )
+            except ingest_engine.IngestCancelled:
+                # Nothing was kept; the runner sees the cancel and says so.
+                return None
             return dataset.as_dict()
 
         job = jobs.submit("open", f"Opening {title}", work)
@@ -340,7 +377,16 @@ def create_app(
         if handler is None:
             raise ApiError(f"Unknown operation: {op}")
         params = {k: v for k, v in (body.get("params") or {}).items()}
-        dataset = handler(ws, dataset, **params)
+        try:
+            dataset = handler(ws, dataset, **params)
+        except TypeError as exc:
+            # A belt-and-braces guard: the UI omits fields the user left empty,
+            # so an operation whose argument is required would otherwise reach
+            # the user as an internal error rather than as "choose a column".
+            if "argument" not in str(exc):
+                raise
+            app.logger.warning("transform %s called with %s: %s", op, sorted(params), exc)
+            raise ApiError("Some required choices are missing for that operation.")
         return jsonify({
             **dataset.as_dict(),
             "can_undo": transform_engine.can_undo(dataset),
@@ -394,6 +440,8 @@ def create_app(
         body = _body()
         fmt = (body.get("format") or "xlsx").lower()
         directory = body.get("directory") or str(Path.home())
+        # Existing files are replaced only when the person has confirmed it.
+        overwrite = body.get("overwrite") is True
 
         def work(job: Any) -> dict[str, Any]:
             def report(payload: dict[str, Any]) -> None:
@@ -411,6 +459,7 @@ def create_app(
                     columns=body.get("columns"),
                     progress=report,
                     cancel=job.cancel_token,
+                    overwrite=overwrite,
                 )
             return export_engine.export_flat(
                 ws, dataset,
@@ -424,6 +473,7 @@ def create_app(
                 suffix_style=body.get("suffix_style") or "alpha",
                 compression=body.get("compression") or "zstd",
                 progress=report,
+                overwrite=overwrite,
             )
 
         job = jobs.submit("export", f"Exporting {dataset.display_name}", work)
@@ -431,16 +481,27 @@ def create_app(
 
     @app.route("/api/reveal", methods=["POST"])
     def reveal() -> Response:
-        """Open the containing folder in the OS file manager."""
+        """Open the containing folder in the OS file manager.
+
+        Only ever a folder. ``os.startfile``, ``open`` and ``xdg-open`` *run* a
+        file they are given, and the parent of a path that passes through a
+        program (``C:\\tools\\app.exe\\x``) is that program, so the folder is
+        checked to be a directory first. On macOS it is revealed with
+        ``open -R``, because an ``.app`` bundle is a directory that plain
+        ``open`` would launch.
+        """
         target = Path(_require(_body(), "path")).expanduser()
         folder = target if target.is_dir() else target.parent
+        if not folder.is_dir():
+            raise ApiError("That folder does not exist any more.", 404)
+        folder = folder.resolve()
         try:
             if platform.system() == "Windows":
                 os.startfile(str(folder))  # type: ignore[attr-defined]
             elif platform.system() == "Darwin":
                 import subprocess
 
-                subprocess.Popen(["open", str(folder)])
+                subprocess.Popen(["open", "-R", str(folder)])
             else:
                 import subprocess
 
@@ -470,7 +531,7 @@ def create_app(
                 if event.get("heartbeat"):
                     yield ": ping\n\n"
                     continue
-                yield f"data: {json.dumps(event)}\n\n"
+                yield f"data: {app.json.dumps(event)}\n\n"
                 if event.get("final"):
                     return
 
@@ -488,18 +549,14 @@ def create_app(
     def sql(dataset_id: str) -> Response:
         dataset = ws.get(dataset_id)
         body = _body()
-        statement = (body.get("query") or "").strip().rstrip(";")
-        if not statement:
-            raise ApiError("Write a query first.")
+        # Checked by reading the statement, not by disabling the filesystem:
+        # `SET disabled_filesystems` is global to the DuckDB instance, so doing
+        # that here left every later file open failing with a permission error
+        # until Grande was restarted.
+        statement = check_read_only(body.get("query") or "")
         limit = max(1, min(int(body.get("limit", 1000)), 10_000))
 
         cur = ws.cursor()
-        try:
-            # A read-only cursor: the escape hatch cannot write files, install
-            # extensions, or modify the workspace.
-            cur.execute("SET disabled_filesystems = 'LocalFileSystem'")
-        except Exception:
-            pass
         try:
             cur.execute(f"CREATE OR REPLACE TEMP VIEW data AS SELECT * FROM {dataset.relation}")
             started = time.time()

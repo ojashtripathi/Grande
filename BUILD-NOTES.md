@@ -10,8 +10,9 @@ offline tool for working with tables too big for Excel. Same goal as the
 original (open huge CSVs, pivot them, export multipart .xlsx), rebuilt because
 the original's core promises did not hold up under inspection.
 
-Original clone kept at `temp/Grande` for reference. A 1M-row benchmark CSV is at
-`bench/bench_1m.csv` (114.5 MB, 12 cols), and a venv with the dependencies at `.venv`.
+The measurements below used a 1,000,000-row benchmark CSV (114.5 MB, 12
+columns); generate any similar file to repeat them. The original repository can
+be cloned from the link above for comparison.
 
 ## What the audit found in the original
 
@@ -166,7 +167,9 @@ From the competitive research, ranked, none of them started:
 ## To resume
 
 ```bash
-cd Grande
-python -m pip install -e .
+cd grande
+python -m venv .venv            # then activate it
+python -m pip install -e ".[dev]"
+python -m pytest
 python -m grande
 ```

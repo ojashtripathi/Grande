@@ -526,7 +526,7 @@ function buildExportForm({ onDone } = {}) {
   goButton.addEventListener('click', async () => {
     goButton.disabled = true;
     try {
-      const result = await runJob(api.export(dataset.id, {
+      const request = {
         format: format.value,
         directory: directory.value,
         base_name: baseName.value,
@@ -535,7 +535,16 @@ function buildExportForm({ onDone } = {}) {
         filters: onlyFiltered.checked ? activeFilters() : [],
         sort: state.sort,
         columns: onlyVisible.checked ? visibleColumnNames() : null,
-      }), { title: 'Exporting…' });
+      };
+      // Ask before replacing anything. The plan is fetched afresh rather than
+      // trusted from the screen, which may predate the last keystroke; the
+      // server refuses to replace files unless `overwrite` is set.
+      const plan = await api.exportPlan(dataset.id, request);
+      if (plan.existing?.length) {
+        if (!(await confirmReplace(plan))) return;
+        request.overwrite = true;
+      }
+      const result = await runJob(api.export(dataset.id, request), { title: 'Exporting…' });
 
       showResult(result);
       onDone?.();
@@ -570,6 +579,30 @@ function buildExportForm({ onDone } = {}) {
         el('span', { class: 'v' }, 'Only the columns currently shown'))),
     planBox,
     el('div', { style: { display: 'flex', gap: '8px', marginTop: '20px' } }, goButton));
+}
+
+/** Ask before an export replaces files that are already in the folder. */
+function confirmReplace(plan) {
+  return new Promise((resolve) => {
+    const names = plan.existing;
+    const shown = names.slice(0, 5).join(', ')
+      + (names.length > 5 ? `, … (${count(names.length)} files)` : '');
+    const box = dialog({
+      title: names.length === 1 ? 'Replace the existing file?' : `Replace ${count(names.length)} existing files?`,
+      body: el('div', {},
+        plan.replaces_source
+          ? el('div', { class: 'note note-warn', style: { marginBottom: '12px' } }, icon('alert', 15),
+            `${plan.replaces_source} is the file you opened. Replacing it overwrites your original with this export.`)
+          : null,
+        el('div', {}, 'Already in that folder: ', el('b', {}, shown))),
+      footer: el('div', { style: { display: 'flex', width: '100%', gap: '8px' } },
+        el('span', { class: 'spacer' }),
+        el('button', { class: 'btn', onclick: () => { resolve(false); box.close(); } }, 'Cancel'),
+        el('button', { class: 'btn btn-primary', onclick: () => { resolve(true); box.close(); } },
+          names.length === 1 ? 'Replace it' : 'Replace them')),
+      onClose: () => resolve(false),
+    });
+  });
 }
 
 function showResult(result) {
@@ -612,10 +645,13 @@ async function pickFolder(startAt) {
       body: el('div', {}, crumb, list),
       footer: el('div', { style: { display: 'flex', width: '100%', gap: '8px' } },
         el('span', { class: 'spacer' }),
-        el('button', { class: 'btn', onclick: () => { box.close(); resolve(null); } }, 'Cancel'),
+        // Settle before closing: close() runs onClose, which resolves null, and
+        // a promise keeps whichever value arrives first — so closing first
+        // threw the chosen folder away.
+        el('button', { class: 'btn', onclick: () => { resolve(null); box.close(); } }, 'Cancel'),
         el('button', {
           class: 'btn btn-primary',
-          onclick: () => { box.close(); resolve(current); },
+          onclick: () => { resolve(current); box.close(); },
         }, 'Use this folder')),
       onClose: () => resolve(null),
     });
@@ -712,15 +748,23 @@ export function mountSql() {
         wrap.replaceChildren(el('div', { style: { padding: '20px' }, class: 'hint' }, 'No columns returned.'));
         return;
       }
-      const table = el('table', { class: 'grid', style: { position: 'static', tableLayout: 'auto' } },
-        el('thead', {}, el('tr', {}, ...result.columns.map((name) =>
-          el('th', {}, el('div', { class: 'th-inner', style: { cursor: 'default' } }, name))))),
-        el('tbody', {}, ...result.rows.map((row) =>
-          el('tr', {}, ...row.map((value) =>
-            el('td', {
-              class: typeof value === 'number' ? 'num' : '',
-              title: String(value ?? ''),
-            }, value === null || value === undefined ? '—' : String(value)))))));
+      const table = el('table', { class: 'result' },
+        el('thead', {}, el('tr', {},
+          el('th', { class: 'rownum' }, '#'),
+          ...result.columns.map((name) => el('th', { title: name }, name)))),
+        el('tbody', {}, ...result.rows.map((row, index) =>
+          el('tr', {},
+            el('td', { class: 'rownum' }, count(index + 1)),
+            ...row.map((value) => {
+              const empty = value === null || value === undefined;
+              const numeric = typeof value === 'number';
+              return el('td', {
+                class: [numeric ? 'num' : '', empty ? 'null' : ''].filter(Boolean).join(' '),
+                // The grouped digits are what is readable; the tooltip keeps
+                // the exact value for copying.
+                title: empty ? '' : String(value),
+              }, empty ? '—' : (numeric ? num(value) : String(value)));
+            })))));
       wrap.replaceChildren(table);
     } catch (error) {
       status.textContent = '';

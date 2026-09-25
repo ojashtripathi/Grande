@@ -13,8 +13,10 @@ if [ -z "$PY" ]; then
   exit 1
 fi
 
-if ! "$PY" -c "import grande" >/dev/null 2>&1; then
-  echo "Installing Grande and its dependencies. This happens once."
+# Install when Grande is missing *or* is installed from another folder: after a
+# newer copy is extracted elsewhere, the old install would otherwise keep running.
+if ! "$PY" -c "import grande, pathlib, sys; sys.exit(0 if pathlib.Path(grande.__file__).resolve().is_relative_to(pathlib.Path('src').resolve()) else 1)" >/dev/null 2>&1; then
+  echo "Installing this copy of Grande and its dependencies. This happens once per copy."
   "$PY" -m pip install --quiet -e .
 fi
 

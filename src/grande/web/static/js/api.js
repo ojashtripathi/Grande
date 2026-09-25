@@ -49,10 +49,17 @@ async function request(path, { method = 'GET', body, signal } = {}) {
 
   const text = await response.text();
   let data = null;
-  try { data = text ? JSON.parse(text) : null; } catch { /* non-JSON error body */ }
+  let unreadable = false;
+  try { data = text ? JSON.parse(text) : null; } catch { unreadable = true; }
 
   if (!response.ok) {
     throw new ApiError(data?.error || text || `Request failed (${response.status})`, response.status);
+  }
+  // A successful reply that is not JSON used to come back as null, and the
+  // caller then failed somewhere unrelated, silently — the screen just stayed
+  // as it was. Say so instead.
+  if (unreadable) {
+    throw new ApiError('Grande sent back a reply this page could not read.', response.status);
   }
   return data;
 }

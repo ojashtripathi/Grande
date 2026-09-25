@@ -17,34 +17,20 @@ machine, and there is no account, no telemetry and no network call after install
 
 ## Install and run
 
-### Option A: Install directly via pip (from GitHub)
 ```bash
-pip install git+https://github.com/ojashtripathi/Grande.git
+pip install grande
 grande
 ```
 
-### Option B: 1-Click Quick Launch (Windows)
-1. Download or clone this repository (or extract `Grande.zip`).
-2. Double-click **`run.bat`**.  
-   *(Grande automatically verifies Python 3.10+, installs dependencies on first launch, and opens in your browser).*
+Your browser opens on a local address. That is the whole setup.
 
-### Option C: Clone & Run Locally
-```bash
-git clone https://github.com/ojashtripathi/Grande.git
-cd Grande
-pip install -e .
-grande
-```
-
-Your browser opens on a local loopback address (`http://127.0.0.1:<port>`). That is the whole setup.
-
-To open a file straight away from the terminal:
+To open a file straight away:
 
 ```bash
-grande "transactions_2024.csv"
+grande "C:\exports\transactions_2024.csv"
 ```
 
-Requires Python 3.10 or newer. On first launch Grande will use DuckDB's compiled Excel
+Requires Python 3.10 or newer. On first launch Grande will use DuckDB's Excel
 writer if it is available, which is about three times faster; if it is not, it
 falls back to a pure-Python writer and everything still works offline.
 
@@ -177,8 +163,8 @@ losing the text quietly.
 ## For developers
 
 ```bash
-git clone https://github.com/ojashtripathi/Grande.git
-cd Grande
+git clone <this repo>
+cd grande
 pip install -e ".[dev]"
 pytest
 grande --no-browser --port 8422

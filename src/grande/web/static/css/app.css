@@ -337,6 +337,10 @@ select.field { padding-right: var(--s-1); cursor: pointer; box-shadow: none; }
 textarea.field {
   height: auto; padding: var(--s-2); font-family: var(--mono);
   line-height: 1.55; resize: vertical;
+  /* A textarea's intrinsic width comes from its `cols` attribute, which
+     defaults to 20 characters — so without this it ignores its container and
+     renders as a narrow sliver. */
+  width: 100%; display: block;
 }
 .field-label {
   display: block; font-size: var(--t-xs); font-weight: 700;
@@ -400,6 +404,10 @@ table.grid th, table.grid td {
   padding: 0 var(--s-2);
   height: var(--row-h);
   overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+  /* Every column in the windowed grid is given an explicit inline width and the
+     table is `table-layout: fixed`, so this only stops a long value from
+     widening its column. It is meaningless without those two things — see
+     `table.result` for static tables, which must size to their content. */
   max-width: 0;
 }
 
@@ -451,6 +459,76 @@ table.grid td.sel { background: var(--selection) !important; box-shadow: inset 0
   user-select: none;
 }
 thead .rownum { z-index: 4; }
+
+/* ------------------------------------------------------------ result tables
+ *
+ * Static tables — SQL results, Show Details, the open-file preview — used to
+ * borrow `table.grid`, which is built for the windowed grid: `table-layout:
+ * fixed` with an explicit width on every column, and `max-width: 0` so a long
+ * value cannot widen one. Borrowed onto an auto-layout table with no widths,
+ * that `max-width: 0` collapses every column to its narrowest possible size,
+ * which crushed the headers to two or three characters and an ellipsis.
+ *
+ * These size to their content instead, and only start truncating once a column
+ * is genuinely too wide to be useful.
+ */
+
+table.result {
+  border-collapse: separate;
+  border-spacing: 0;
+  table-layout: auto;
+  width: 100%;
+  font-size: var(--t-md);
+  background: var(--bg);
+}
+
+table.result th,
+table.result td {
+  padding: 5px var(--s-3);
+  border-right: 1px solid var(--grid-line);
+  border-bottom: 1px solid var(--grid-line);
+  text-align: left;
+  vertical-align: top;
+  max-width: 420px;                 /* generous, but stops one essay column */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+table.result th:last-child,
+table.result td:last-child { border-right: none; }
+
+table.result thead th {
+  position: sticky; top: 0; z-index: 2;
+  background: var(--grid-header);
+  border-bottom: 2px solid var(--border-strong);
+  font-weight: 700;
+  white-space: nowrap;
+  /* A header must never be the thing that is truncated: it is the shortest
+     text in the column and the one you need in order to read the rest. */
+  max-width: none;
+  overflow: visible;
+}
+table.result thead th .kind {
+  font-size: 9px; font-weight: 800; letter-spacing: .06em;
+  color: var(--text-subtle); text-transform: uppercase;
+  margin-left: 6px;
+}
+
+table.result tbody tr:nth-child(even) td { background: var(--grid-stripe); }
+table.result tbody tr:hover td { background: var(--surface-hover); }
+table.result td.num { text-align: right; font-variant-numeric: tabular-nums; }
+table.result td.null { color: var(--text-subtle); font-style: italic; }
+
+table.result .rownum {
+  position: sticky; left: 0; z-index: 1;
+  background: var(--grid-header);
+  color: var(--text-subtle);
+  text-align: right; font-size: var(--t-sm);
+  border-right: 2px solid var(--border-strong);
+  user-select: none;
+  width: 1%; white-space: nowrap;
+}
+table.result thead .rownum { z-index: 3; }
 
 /* ---------------------------------------------------------------- popovers */
 
@@ -748,11 +826,16 @@ table.pivot tfoot td.rowlabel { z-index: 4; text-align: left; }
   position: fixed; inset: 0; z-index: 80;
   background: rgba(38, 33, 25, .46);
   display: grid; place-items: center; padding: var(--s-4);
+  /* One cell the size of the window, never of the content. An auto track
+     grows to fit its item's widest content, so a 150-column preview table
+     (37,000px) widened it and the dialog, centred in it, landed far off-screen:
+     the page dimmed and nothing appeared. Wide content now scrolls inside. */
+  grid-template: minmax(0, 1fr) / minmax(0, 1fr);
   animation: fade var(--fast) both;
 }
 @keyframes fade { from { opacity: 0; } }
 .dialog {
-  width: min(620px, 100%); max-height: 86vh;
+  width: min(620px, 100%); max-height: 86vh; min-width: 0;
   display: flex; flex-direction: column;
   background: var(--surface);
   border: 1px solid var(--border-strong);
