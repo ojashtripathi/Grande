@@ -18,7 +18,7 @@ machine, and there is no account, no telemetry and no network call after install
 ## Install and run
 
 ```bash
-pip install grande
+pip install <repo>
 grande
 ```
 
